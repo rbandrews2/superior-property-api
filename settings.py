@@ -15,3 +15,8 @@ class Settings(BaseSettings):
 
 def get_settings() -> 'Settings':
     return Settings()
+
+User question -> Parse/normalize address -> Gather raw data (APIs/db)
+ -> Chunk & embed docs -> top-k retrieval (pgvector)
+ -> LLM answers with citations + JSON payloads
+ -> Store run + feedback in Supabase
