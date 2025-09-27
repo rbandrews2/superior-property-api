@@ -1,244 +1,128 @@
-# main.py
-import os
-import datetime as dt
-from typing import Optional, List, Dict, Any
-import os 
-import httpx
+import os, json, math, uuid, asyncio
+from typing import List, Optional
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr
+import httpx
+import asyncpg
 
-# ------------------------------------------------------------------------------
-
-# Environment
-# ------------------------------------------------------------------------------
-ACS_YEAR = os.getenv("ACS_YEAR", "2022")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 RENTCAST_API_KEY = os.getenv("RENTCAST_API_KEY")
-ALLOWED = set(e.strip().lower() for e in os.getenv("ALLOW_EMAILS","").split(",") if e.strip())
-PORT = int(os.getenv("PORT", "10000"))
-CORS_ORIGINS = [o.strip() for o in os.getenv(
-    "CORS_ORIGINS",
-    "https://superiorllc.org,https://app.superiorllc.org"
-).split(",")]
+CORS = [o.strip() for o in os.getenv("CORS_ORIGINS","").split(",") if o.strip()]
 
-# ------------------------------------------------------------------------------
-# App
-# ------------------------------------------------------------------------------
-app = FastAPI(title="safe-keeping-api")
+app = FastAPI(title="superior-ai")
+app.add_middleware(CORSMiddleware, allow_origins=CORS or ["*"], allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+PG_DSN = os.getenv("PG_DSN")  # e.g. postgres://user:pass@host:5432/db
 
-# ------------------------------------------------------------------------------
-# Models
-# ------------------------------------------------------------------------------
-class GenerateReportRequest(BaseModel): address: str email: EmailStr
-  @app.post("/api/generate-report") async def generate_report(payload:
-GenerateReportRequest): return {"ok": True, "echo": {"address": payload.address,
-"email": payload.email}}
-                                                              
-# ------------------------------------------------------------------------------
-# Utility helpers
-# ------------------------------------------------------------------------------
-def _date_str(d: dt.date) -> str:
-    return d.strftime("%Y-%m-%d")
+# ---------- Models
+class AskPayload(BaseModel):
+    query: str
+    address: Optional[str] = None
+    k: int = 8
 
-async def geocode(address: str) -> Dict[str, Any]:
-    if not GOOGLE_MAPS_API_KEY:
-        raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY not set")
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"address": address, "key": GOOGLE_MAPS_API_KEY}
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url, params=params)
-    data = r.json()
-    result = (data.get("results") or [None])[0]
-    if not result:
-        raise HTTPException(status_code=404, detail="Address not found")
-    loc = result["geometry"]["location"]
-    return {
-        "lat": loc["lat"],
-        "lng": loc["lng"],
-        "formattedAddress": result.get("formatted_address")
-    }
+class AiAnswer(BaseModel):
+    answer: str
+    references: List[str] = Field(default_factory=list)
+    data: dict = Field(default_factory=dict)
 
-async def fetch_property(address: str) -> Any:
-    if not RENTCAST_API_KEY:
-        raise HTTPException(status_code=500, detail="RENTCAST_API_KEY not set")
-    url = "https://api.rentcast.io/v1/properties"
-    headers = {"X-Api-Key": RENTCAST_API_KEY, "Accept": "application/json"}
-    params = {"address": address}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers=headers, params=params)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Rentcast error {r.status_code}")
-    return r.json()
+# ---------- DB / Vector helpers
+async def pg():
+    return await asyncpg.connect(PG_DSN)
 
-async def fetch_fbi_agencies(lat: float, lng: float) -> List[Dict[str, Any]]:
-    # Try alternative param names used by the FBI SAPI
-    urls = [
-        ("https://api.usa.gov/crime/fbi/sapi/api/agencies/bylocation", {"lat": lat, "long": lng}),
-        ("https://api.usa.gov/crime/fbi/sapi/api/agencies/bylocation", {"latitude": lat, "longitude": lng}),
-    ]
-    async with httpx.AsyncClient(timeout=12) as client:
-        for base, params in urls:
-            try:
-                r = await client.get(base, params=params)
-                if r.status_code < 400:
-                    data = r.json()
-                    items = data.get("agencies") if isinstance(data, dict) else data
-                    agencies = [
-                        {
-                            "ori": a.get("ori"),
-                            "agencyName": a.get("agency_name") or a.get("agencyName"),
-                            "agencyType": a.get("agency_type") or a.get("agencyType"),
-                            "city": a.get("city"),
-                            "state": a.get("state_abbr") or a.get("stateAbbr"),
-                        }
-                        for a in (items or [])
-                        if a and a.get("ori")
-                    ]
-                    seen, uniq = set(), []
-                    for a in agencies:
-                        if a["ori"] in seen:
-                            continue
-                        seen.add(a["ori"])
-                        uniq.append(a)
-                    return uniq[:15]
-            except Exception:
-                continue
-    return []
+EMBED_MODEL = "text-embedding-3-large"
+CHAT_MODEL = "gpt-4.1-mini"  # adjust as needed
 
-async def fetch_crime(lat: float, lng: float, radius_miles: float = 3.0, days: int = 30) -> Dict[str, Any]:
-    # Placeholder structure for now
-    today = dt.date.today()
-    start_30 = today - dt.timedelta(days=days)
-    start_12m = (today.replace(day=1) - dt.timedelta(days=365)).replace(day=1)
-    agencies = await fetch_fbi_agencies(lat, lng)
-    return {
-        "filters": {
-            "center": {"lat": lat, "lng": lng},
-            "radiusMiles": radius_miles,
-            "last30d": {"from": _date_str(start_30), "to": _date_str(today)},
-            "last12m": {"from": _date_str(start_12m), "to": _date_str(today)},
-        },
-        "summary": {
-            "last30dTotal": 0,
-            "trend12m": [],
-            "byType": {},
-        },
-        "incidents": [],
-        "fbiAgencies": agencies,
-    }
+async def embed(texts: List[str]) -> List[List[float]]:
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            "https://api.openai.com/v1/embeddings",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={"input": texts, "model": EMBED_MODEL},
+        )
+    r.raise_for_status()
+    return [d["embedding"] for d in r.json()["data"]]
 
-async def get_fips_from_latlng(lat: float, lng: float) -> Dict[str, str]:
-    url = "https://geo.fcc.gov/api/census/block/find"
-    params = {"latitude": lat, "longitude": lng, "format": "json"}
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url, params=params)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail="FCC FIPS lookup failed")
-    data = r.json()
-    blk = data.get("Block", {})
-    fips = blk.get("FIPS")
-    if not fips or len(fips) < 11:
-        raise HTTPException(status_code=404, detail="FIPS not found")
-    state = fips[0:2]
-    county = fips[2:5]
-    tract = fips[5:11]  # 6-digit tract code
-    return {"state": state, "county": county, "tract": tract}
+async def chat(messages: List[dict]) -> str:
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={
+                "model": CHAT_MODEL,
+                "messages": messages,
+                "temperature": 0.2,
+            },
+        )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
 
-async def fetch_acs_demographics(state: str, county: str, tract: str) -> Dict[str, Any]:
-    base = f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5"
-    vars_ = ["NAME", "B19013_001E", "B25003_001E", "B25003_002E", "B25003_003E"]
-    params = {
-        "get": ",".join(vars_),
-        "for": f"tract:{tract}",
-        "in": f"state:{state} county:{county}",
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(base, params=params)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"ACS error {r.status_code}")
-    rows = r.json()
-    if not rows or len(rows) < 2:
-        raise HTTPException(status_code=404, detail="ACS data not found")
-    hdr, val = rows[0], rows[1]
-    rec = {hdr[i]: val[i] for i in range(len(hdr))}
+# ---------- External data fetchers (stubs to wire real calls)
+async def get_rentcast(address: str) -> dict:
+    # You already use RentCast—swap with your real endpoint + lat/lng
+    return {"rentcast": {"address": address, "sample": True}}
 
-    def num(x):
-        try:
-            return float(x)
-        except Exception:
-            return None
+async def get_crime_nearby(address: str) -> dict:
+    # Replace with your scraper or vendor
+    return {"crime": {"address": address, "incidents_12mo": 42}}
 
-    median_income = num(rec.get("B19013_001E"))
-    occ_total = num(rec.get("B25003_001E")) or 0
-    owner = num(rec.get("B25003_002E")) or 0
-    renter = num(rec.get("B25003_003E")) or 0
-    owner_pct = (owner / occ_total) if occ_total else None
-    renter_pct = (renter / occ_total) if occ_total else None
+# ---------- Retrieval (pgvector)
+# SQL table (run once):
+# CREATE TABLE IF NOT EXISTS documents(
+#   id uuid PRIMARY KEY,
+#   address text,
+#   title text,
+#   content text,
+#   source text,
+#   embedding vector(3072)
+# );
+# CREATE INDEX IF NOT EXISTS idx_docs_embedding ON documents USING ivfflat (embedding vector_cosine_ops);
 
-    return {
-        "name": rec.get("NAME"),
-        "medianHouseholdIncome": median_income,
-        "tenure": {"ownerPct": owner_pct, "renterPct": renter_pct},
-        "fips": {
-            "state": rec.get("state"),
-            "county": rec.get("county"),
-            "tract": rec.get("tract"),
-        }
-        "acsYear": ACS_YEAR,
-    }
+async def retrieve_similar(q_embed: List[float], k: int):
+    conn = await pg()
+    rows = await conn.fetch(
+        "SELECT id, title, content, source FROM documents ORDER BY embedding <=> $1 LIMIT $2",
+        q_embed, k
+    )
+    await conn.close()
+    return [dict(r) for r in rows]
 
-# ------------------------------------------------------------------------------
-# Routes
-# ------------------------------------------------------------------------------
-@app.get("/", include_in_schema=False)
-def root():
-    # Nice landing so "/" isn't 404
-    return JSONResponse({"ok": True, "service": "superior API", "docs": "/docs"})
+# ---------- Routes
+@app.get("/")
+def root(): return {"message": "Superior AI online"}
 
-@app.get("/health", include_in_schema=False)
-async def health():
-    return {"ok": True, "app": "safe-keeping-api"}
+@app.post("/ai/ask", response_model=AiAnswer)
+async def ai_ask(payload: AskPayload):
+    if not OPENAI_API_KEY: raise HTTPException(500, "Missing OPENAI_API_KEY")
+    # 1) Embed query
+    [q_vec] = await embed([payload.query])
+    # 2) Retrieve context
+    docs = await retrieve_similar(q_vec, payload.k)
+    ctx = "\n\n".join([f"[{d['title']}] {d['content']}" for d in docs])
+    # 3) Fetch live data (non-blocking)
+    address = payload.address or ""
+    rentcast_task = asyncio.create_task(get_rentcast(address)) if address else None
+    crime_task = asyncio.create_task(get_crime_nearby(address)) if address else None
 
-@app.post("/api/generate-report")
-async def generate_report(payload: GenerateReportRequest):
-    # 1) Geocode
-    geo = await geocode(payload.address)
-    # 2) Property basics
-    prop = await fetch_property(payload.address)
-    # 3) Census geo → ACS
-    fips = await get_fips_from_latlng(geo["lat"], geo["lng"])
-    demo = await fetch_acs_demographics(fips["state"], fips["county"], fips["tract"])
-    # 4) (Optional) Crime scaffold
-    crime = await fetch_crime(geo["lat"], geo["lng"])
+    # 4) Compose prompt
+    sys = (
+      "You are Superior AI, a cautious property analyst. "
+      "Answer ONLY from provided context and data; if unsure, say what’s missing. "
+      "Always include short bullet references to sources."
+    )
+    user = f"Question: {payload.query}\n\nContext:\n{ctx[:12000]}"
+    if address: user += f"\n\nFocus address: {address}"
 
-@app.post("/api/v2/generate-report")
-  async def generate_report_v2(payload: GenerateReportV2):   
-   return {"ok": True, "v": 2, "echo": {"address": payload.address,"email": payload.email}}
-     
-                                        
-return {
-        "ok": True,
-        "step": "geocode+property+demographics+crime",
-        "address": payload.address,
-        "email": payload.email,
-        "geo": geo,
-        "property": prop,
-        "demographics": demo,
-        "crime": crime,
-    }
+    # 5) Call LLM
+    text = await chat([{"role":"system","content":sys},{"role":"user","content":user}])
 
+    # 6) Gather live data
+    live = {}
+    if rentcast_task: live.update(await rentcast_task)
+    if crime_task: live.update(await crime_task)
 
-
-
-
-
+    refs = [d["source"] for d in docs]
+    return AiAnswer(answer=text, references=list(dict.fromkeys(refs)), data=live)
